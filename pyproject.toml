@@ -5,19 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pycause"
 version = "0.1.0"
-description = "Runtime Data Provenance & Symbolic Math Engine for Python"
+description = "Runtime Data Provenance & Natural Language Engine for Python"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "TonyMic", email = "tony1225leung@gmail.com" },
+    { name = "TonyMic", email = "tony@example.com" },
 ]
-keywords = ["provenance", "debugging", "symbolic-math", "causal-chain"]
+keywords = ["provenance", "debugging", "symbolic-math", "causal-chain", "nlp"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+
+[project.scripts]
+cause = "pycause.cli:main"
 
 [project.urls]
 Homepage = "https://tony123-tech.github.io/pycause/"

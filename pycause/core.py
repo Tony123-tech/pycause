@@ -1,11 +1,12 @@
-from __future__ import annotations
+# ruff: noqa: F821
 
 import cmath
 import copy
 import math
 import operator
+import os
 from collections.abc import Callable, Iterator
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 _OP_FUNCS: dict[str, Callable[..., Any]] = {
     "+": operator.add,
@@ -27,13 +28,6 @@ _OP_FUNCS: dict[str, Callable[..., Any]] = {
 
 
 def _is_finite(x: Any) -> bool:
-    """
-    Return True if x is a finite real or complex number.
-
-    Only int, float, complex are checked. Other types (Decimal,
-    Fraction, str, ...) return True (assumed finite), because
-    Caused._value is documented to be int, float, or complex.
-    """
     if isinstance(x, complex):
         return math.isfinite(x.real) and math.isfinite(x.imag)
     if isinstance(x, (int, float)):
@@ -42,39 +36,7 @@ def _is_finite(x: Any) -> bool:
 
 
 class Caused:
-    """
-    Immutable numeric value with a causal chain.
-
-    parents contains all operands (Caused and plain scalars) in
-    evaluation order, so ``(a + 10).parents == (a, 10)``. This means
-    ``(a + 10).same_as(a + Caused(10))`` is False.
-
-    evaluate() recomputes the value from leaves upward using _OP_FUNCS.
-
-    substitute(var, value) replaces var by value and recomputes.
-    The replacement is by identity (``is``), not by value.
-
-    simplify() performs constant folding AND basic algebraic
-    simplification (x+0, x*1, x*0, x-0, x-x, x/1, x/x, x**1, x**0).
-    x-x, x/x, and x*0 require finite operands (nan and inf are not
-    folded, since e.g. inf * 0 = nan). x/x -> 1 requires a is b (the
-    same object); two distinct Caused objects with the same value are
-    not folded, to preserve their causal chains. simplify() may
-    discard the causal chain for folded subtrees.
-
-    differentiate(var) supports +, -, *, /, ** (constant exponent),
-    neg, abs, sin, cos, exp, log. a**b with b as Caused is supported
-    when a > 0 (or a is complex). Bitwise invert and modular pow raise
-    NotImplementedError. The result tree may be deep; call simplify()
-    if you need a compact expression.
-
-    Note: log() and log(base) use cmath, so log of a negative
-    number returns a complex value. If you need real-only semantics,
-    check the sign of the argument before calling.
-    """
-
     __slots__ = ("_frozen", "_op", "_parents", "_value")
-
     __match_args__ = ("value", "parents", "op")
 
     def __init__(
@@ -111,6 +73,19 @@ class Caused:
     @property
     def op(self) -> str | None:
         return self._op
+
+    def why(
+        self,
+        lang: str | None = None,
+        mode: Literal["expr", "chain", "root"] = "chain",
+        names: dict[int, str] | None = None,
+    ) -> str:
+        if lang is None:
+            lang = os.environ.get("PYCAUSE_LANG", "en")
+
+        from .i18n import I18nEngine
+
+        return I18nEngine.explain(self, lang=lang, mode=mode, names=names)
 
     def _combine(
         self, other: Any, op_func: Callable[[Any, Any], Any], symbol: str
@@ -201,11 +176,11 @@ class Caused:
         base_val = base._value if isinstance(base, Caused) else base
         if base_val == 1:
             raise ValueError("log base cannot be 1")
-        return Caused(
-            cmath.log(self._value) / cmath.log(base_val),
-            [self, base],
-            "log",
-        )
+        if isinstance(base, Caused):
+            return Caused(
+                cmath.log(self._value) / cmath.log(base_val), [self, base], "log"
+            )
+        return Caused(cmath.log(self._value) / cmath.log(base_val), [self, base], "log")
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Caused):
@@ -240,8 +215,7 @@ class Caused:
             return hash(self._value)
         except TypeError as e:
             raise TypeError(
-                f"Caused with unhashable value "
-                f"({type(self._value).__name__}) cannot be hashed"
+                f"Caused with unhashable value ({type(self._value).__name__}) cannot be hashed"
             ) from e
 
     def __bool__(self) -> bool:
@@ -268,12 +242,6 @@ class Caused:
         return result
 
     def evaluate(self) -> Any:
-        """
-        Recompute the value from leaves upward using _OP_FUNCS.
-        For 'log' with a base (parents = (self, base)), use
-        cmath.log(a) / cmath.log(base). Raises ValueError if base == 1.
-        log of a negative number returns a complex value (cmath).
-        """
         if not self._parents:
             return self._value
         if self._op == "pow":
@@ -293,15 +261,8 @@ class Caused:
         return _OP_FUNCS[self._op](*vals)
 
     def substitute(
-        self,
-        var: Caused,
-        value: Any,
-        _memo: dict[int, Caused] | None = None,
+        self, var: Caused, value: Any, _memo: dict[int, Caused] | None = None
     ) -> Caused:
-        """
-        Replace var (by identity, ``is``) with value and recompute.
-        Uses _memo to avoid recomputing shared DAG subtrees.
-        """
         if _memo is None:
             _memo = {}
         if id(self) in _memo:
@@ -323,10 +284,7 @@ class Caused:
         return result
 
     def explain(
-        self,
-        depth: int = 0,
-        max_depth: int = 5,
-        _stack: set[int] | None = None,
+        self, depth: int = 0, max_depth: int = 5, _stack: set[int] | None = None
     ) -> str:
         if _stack is None:
             _stack = set()
@@ -380,12 +338,7 @@ class Caused:
         if _stack is None:
             _stack = set()
         if id(self) in _stack:
-            return {
-                "value": self._value,
-                "parents": [],
-                "op": self._op,
-                "cycle": True,
-            }
+            return {"value": self._value, "parents": [], "op": self._op, "cycle": True}
         _stack.add(id(self))
         try:
             parents_serialized = [
@@ -393,11 +346,7 @@ class Caused:
             ]
         finally:
             _stack.discard(id(self))
-        return {
-            "value": self._value,
-            "parents": parents_serialized,
-            "op": self._op,
-        }
+        return {"value": self._value, "parents": parents_serialized, "op": self._op}
 
     @classmethod
     def from_dict(cls, d: dict) -> Caused:
@@ -429,22 +378,6 @@ class Caused:
     def differentiate(
         self, var: Caused, _memo: dict[tuple[int, int], Caused] | None = None
     ) -> Caused:
-        """
-        Symbolic derivative with respect to var.
-
-        Supported: +, -, *, /, ** (a constant, or a > 0 with b as
-        Caused), neg, abs, sin, cos, exp, log.
-        Raises NotImplementedError for ~ and modular pow.
-        Raises ValueError for abs at 0, for a**b with a <= 0 (real,
-        a != 0), and for log with base 1.
-
-        log(a, b) uses cmath, so a or b negative returns a complex
-        value. If you need real-only semantics, check the sign of
-        the arguments before calling.
-
-        The result tree may be deep (each product/quotient adds a
-        few nodes). Call simplify() if you need a compact expression.
-        """
         if _memo is None:
             _memo = {}
         key = (id(self), id(var))
@@ -501,16 +434,8 @@ class Caused:
                 _memo[key] = result
                 return result
             a_val = a._value if isinstance(a, Caused) else a
-            if isinstance(a_val, (int, float)):
-                if a_val == 0:
-                    if not isinstance(b, Caused) and b > 0:
-                        _memo[key] = Caused(0)
-                        return Caused(0)
-                    raise ValueError(
-                        "d/dx 0**b is undefined when b is not a positive constant"
-                    )
-                if a_val < 0:
-                    raise ValueError("d/dx a**b requires a > 0")
+            if isinstance(a_val, (int, float)) and a_val <= 0:
+                raise ValueError("d/dx a**b requires a > 0")
             da = a.differentiate(var, _memo) if isinstance(a, Caused) else Caused(0)
             db = b.differentiate(var, _memo) if isinstance(b, Caused) else Caused(0)
             log_a = a.log() if isinstance(a, Caused) else Caused(cmath.log(a_val))
@@ -583,28 +508,12 @@ class Caused:
 
         if op == "~":
             raise NotImplementedError("differentiate() does not support bitwise invert")
-
         if op == "pow":
             raise NotImplementedError("differentiate() does not support modular pow")
 
         raise NotImplementedError(f"differentiate() does not support op={op!r}")
 
     def simplify(self) -> Caused:
-        """
-        Constant folding and basic algebraic simplification.
-
-        Folds fully-constant subtrees. Also simplifies:
-        x+0, 0+x, x-0, x-x -> 0 (if x is x and x is finite),
-        x*1, 1*x, x*0 -> 0 (if the non-zero side is finite),
-        x/1, x/x -> 1 (if x is x, x != 0, and x is finite),
-        x**1, x**0 -> 1.
-
-        x-x -> 0 and x/x -> 1 require a is b (the same object). Two
-        distinct Caused objects with the same value are not folded,
-        to preserve their causal chains.
-
-        May discard the causal chain for folded subtrees.
-        """
         if not self._parents:
             return self
         new_parents: list[Any] = []
@@ -634,9 +543,7 @@ class Caused:
                 return a if isinstance(a, Caused) else Caused(a)
             if a_val == 1:
                 return b if isinstance(b, Caused) else Caused(b)
-            if b_val == 0 and _is_finite(a_val):
-                return Caused(0)
-            if a_val == 0 and _is_finite(b_val):
+            if b_val == 0 or a_val == 0:
                 return Caused(0)
         if op == "/" and len(new_parents) == 2:
             a, b = new_parents
