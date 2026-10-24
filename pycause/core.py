@@ -2,9 +2,12 @@
 
 import cmath
 import copy
+import hashlib
+import json
 import math
 import operator
 import os
+import time
 from collections.abc import Callable, Iterator
 from typing import Any, ClassVar, Literal
 
@@ -35,15 +38,87 @@ def _is_finite(x: Any) -> bool:
     return True
 
 
+def _ast_node(parent: Any, seen: dict[int, str]) -> dict:
+    """Helper: convert a parent (Caused or raw value) to an AST node."""
+    if isinstance(parent, Caused):
+        return parent.to_ast(seen)
+    return {"type": "Constant", "value": parent}
+
+
+def pretty_print_ast(node: dict, indent: int = 0) -> str:
+    """Render an AST dict produced by Caused.to_ast() as indented text."""
+    prefix = "  " * indent
+    t = node["type"]
+
+    if t == "Constant":
+        return f"{prefix}{node['value']!r}"
+
+    if t == "Ref":
+        return f"{prefix}<ref {node['ref']}>"
+
+    if t == "BinOp":
+        lines = [f"{prefix}{node['op']}:"]
+        lines.append(pretty_print_ast(node["left"], indent + 1))
+        lines.append(pretty_print_ast(node["right"], indent + 1))
+        return "\n".join(lines)
+
+    if t == "UnaryOp":
+        lines = [f"{prefix}{node['op']}:"]
+        lines.append(pretty_print_ast(node["operand"], indent + 1))
+        return "\n".join(lines)
+
+    if t == "Call":
+        lines = [f"{prefix}{node['func']}:"]
+        for arg in node["args"]:
+            lines.append(pretty_print_ast(arg, indent + 1))
+        return "\n".join(lines)
+
+    return f"{prefix}<{t}>"
+
+
+def _rebuild_caused(
+    value: Any,
+    parents: tuple,
+    op: str | None,
+    timestamp: int,
+) -> Caused:
+    """Helper for pickle: rebuild a Caused without triggering __setattr__."""
+    return Caused(value, parents, op, timestamp)
+
+
 class Caused:
-    __slots__ = ("_frozen", "_op", "_parents", "_value")
+    __slots__ = ("_frozen", "_op", "_parents", "_timestamp", "_value")
     __match_args__ = ("value", "parents", "op")
+
+    _BINARY_AST: ClassVar[dict[str, str]] = {
+        "+": "Add",
+        "-": "Sub",
+        "*": "Mult",
+        "/": "Div",
+        "//": "FloorDiv",
+        "%": "Mod",
+        "**": "Pow",
+    }
+    _UNARY_AST: ClassVar[dict[str, str]] = {
+        "neg": "USub",
+        "pos": "UAdd",
+        "~": "Invert",
+    }
+    _CALL_AST: ClassVar[dict[str, str]] = {
+        "abs": "Abs",
+        "sin": "Sin",
+        "cos": "Cos",
+        "exp": "Exp",
+        "log": "Log",
+        "d": "Derivative",
+    }
 
     def __init__(
         self,
         value: Any,
         parents: list | tuple | None = None,
         op: str | None = None,
+        timestamp: int | None = None,
     ) -> None:
         if isinstance(value, Caused):
             raise TypeError(
@@ -52,6 +127,9 @@ class Caused:
         object.__setattr__(self, "_value", value)
         object.__setattr__(self, "_parents", tuple(parents) if parents else ())
         object.__setattr__(self, "_op", op)
+        object.__setattr__(
+            self, "_timestamp", timestamp if timestamp is not None else time.time_ns()
+        )
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -73,6 +151,10 @@ class Caused:
     @property
     def op(self) -> str | None:
         return self._op
+
+    @property
+    def timestamp(self) -> int:
+        return self._timestamp
 
     def why(
         self,
@@ -114,18 +196,19 @@ class Caused:
 
     def __pow__(self, other: Any, modulo: Any = None) -> Caused:
         if modulo is not None:
-            if isinstance(other, Caused):
-                return Caused(
-                    pow(self._value, other._value, modulo), [self, other], "pow"
-                )
-            return Caused(pow(self._value, other, modulo), [self, other], "pow")
+            modulo_val = modulo._value if isinstance(modulo, Caused) else modulo
+            other_val = other._value if isinstance(other, Caused) else other
+            parents: list[Any] = [self, other]
+            if isinstance(modulo, Caused):
+                parents.append(modulo)
+            return Caused(pow(self._value, other_val, modulo_val), parents, "pow")
         return self._combine(other, operator.pow, "**")
 
     def __radd__(self, other: Any) -> Caused:
-        return self._combine(other, operator.add, "+")
+        return self._rcombine(other, operator.add, "+")
 
     def __rmul__(self, other: Any) -> Caused:
-        return self._combine(other, operator.mul, "*")
+        return self._rcombine(other, operator.mul, "*")
 
     def _rcombine(
         self, other: Any, op_func: Callable[[Any, Any], Any], symbol: str
@@ -237,6 +320,7 @@ class Caused:
                 for p in self._parents
             ),
             self._op,
+            self._timestamp,
         )
         memo[id(self)] = result
         return result
@@ -331,14 +415,26 @@ class Caused:
     def __repr__(self) -> str:
         return f"Caused({self._value!r})"
 
+    def __reduce__(self) -> tuple:
+        return (
+            _rebuild_caused,
+            (self._value, self._parents, self._op, self._timestamp),
+        )
+
     def __getnewargs__(self) -> tuple:
-        return (self._value, self._parents, self._op)
+        return (self._value, self._parents, self._op, self._timestamp)
 
     def to_dict(self, _stack: set[int] | None = None) -> dict:
         if _stack is None:
             _stack = set()
         if id(self) in _stack:
-            return {"value": self._value, "parents": [], "op": self._op, "cycle": True}
+            return {
+                "value": self._value,
+                "parents": [],
+                "op": self._op,
+                "timestamp": self._timestamp,
+                "cycle": True,
+            }
         _stack.add(id(self))
         try:
             parents_serialized = [
@@ -346,7 +442,12 @@ class Caused:
             ]
         finally:
             _stack.discard(id(self))
-        return {"value": self._value, "parents": parents_serialized, "op": self._op}
+        return {
+            "value": self._value,
+            "parents": parents_serialized,
+            "op": self._op,
+            "timestamp": self._timestamp,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> Caused:
@@ -358,7 +459,7 @@ class Caused:
             )
             for p in d.get("parents", [])
         ]
-        return cls(d["value"], parents, d.get("op"))
+        return cls(d["value"], parents, d.get("op"), d.get("timestamp"))
 
     def same_as(self, other: Any) -> bool:
         if not isinstance(other, Caused):
@@ -644,3 +745,73 @@ class Caused:
 
         _render(self, "", True, True)
         return "\n".join(lines)
+
+    def to_ast(self, _seen: dict[int, str] | None = None) -> dict:
+        """Convert this Caused tree into a Python-ast-style dict.
+
+        Layout follows Python's ast module:
+          Constant   {type, value}
+          BinOp      {type, op, left, right}
+          UnaryOp    {type, op, operand}
+          Call       {type, func, args}
+          Ref        {type, ref}        (shared node in a DAG)
+        """
+        if _seen is None:
+            _seen = {}
+
+        if id(self) in _seen:
+            return {"type": "Ref", "ref": _seen[id(self)]}
+
+        node_id = f"n{len(_seen)}"
+        _seen[id(self)] = node_id
+
+        if not self._parents or self._op is None:
+            return {"type": "Constant", "value": self._value}
+
+        op = self._op
+        parents = self._parents
+
+        if op in self._BINARY_AST and len(parents) == 2:
+            return {
+                "type": "BinOp",
+                "op": self._BINARY_AST[op],
+                "left": _ast_node(parents[0], _seen),
+                "right": _ast_node(parents[1], _seen),
+            }
+
+        if op in self._UNARY_AST and len(parents) == 1:
+            return {
+                "type": "UnaryOp",
+                "op": self._UNARY_AST[op],
+                "operand": _ast_node(parents[0], _seen),
+            }
+
+        if op in self._CALL_AST:
+            return {
+                "type": "Call",
+                "func": self._CALL_AST[op],
+                "args": [_ast_node(p, _seen) for p in parents],
+            }
+
+        if op == "pow" and len(parents) == 3:
+            return {
+                "type": "Call",
+                "func": "PowMod",
+                "args": [_ast_node(p, _seen) for p in parents],
+            }
+
+        return {
+            "type": "Call",
+            "func": op,
+            "args": [_ast_node(p, _seen) for p in parents],
+        }
+
+    def content_hash(self) -> str:
+        """SHA-256 over a canonical serialisation of the AST."""
+        canonical = json.dumps(
+            self.to_ast(),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
